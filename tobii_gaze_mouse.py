@@ -1,27 +1,32 @@
 """
 tobii_gaze_mouse.py
 ───────────────────
-CALIBRATION FLOW:
+CALIBRATION FLOW (default — smooth pursuit):
   Phase 1 — Tobii screen calibration (5 points, standard)
-  Phase 2 — Edge trace calibration (20 points around the border)
-             Your actual gaze-at-edge data is used to fit a personal
-             correction transform, replacing the generic expansion curve.
+  Phase 2 — Smooth pursuit: follow a moving dot (figure-8, ~15 s)
+             Collects hundreds of gaze→screen pairs across the full screen
+  Phase 3 — Validation grid: 9-point accuracy check with error display
+             Accept or redo if accuracy looks poor
+
+CALIBRATION FLOW (legacy — edge trace, --legacy flag):
+  Phase 1 — Tobii screen calibration (5 points, standard)
+  Phase 2 — Edge trace (20 points around the border)
 
 LIVE CONTROLS:
-  Eyes move      →  mouse follows gaze (edge-corrected)
+  Eyes move      →  mouse follows gaze (corrected)
   Gaze + hold    →  cursor snaps & locks to dwell centroid
-  UI element nearby →  stronger gravity pulls cursor to centre of element
-  Double-blink   →  left-click at locked/gravity position
+  Double-blink   →  left-click at locked position
   Esc / Ctrl+C   →  quit
   Mouse top-left →  emergency kill (pyautogui failsafe)
 
 Requirements:
-    py -3.10 -m pip install tobii_research pyautogui pywinauto
+    py -3.10 -m pip install tobii_research pyautogui pywinauto numpy
 Run:
     py -3.10 tobii_gaze_mouse.py
+    py -3.10 tobii_gaze_mouse.py --legacy   (use old edge-trace calibration)
 """
 
-import sys, time, threading, collections, math, tkinter as tk
+import sys, time, threading, collections, math, tkinter as tk, argparse
 
 try:
     import tobii_research as tr
@@ -53,26 +58,37 @@ BLINK_MAX_MS           = 600
 DOUBLE_BLINK_WINDOW_MS = 500
 COOLDOWN_MS            = 800
 
-GAZE_SMOOTH_SAMPLES    = 12
-MOUSE_SMOOTHING        = 0.55  # higher = smoother/slower, lower = snappier
-MOVE_THRESHOLD_PX      = 6
+GAZE_Y_OFFSET          = 0.0    # manual Y bias — set to 0 when polynomial correction is active
+
+# Smooth pursuit calibration settings
+PURSUIT_LAG_MS         = 120    # ms — how far behind the dot your eyes trail during pursuit
+                                 # increase if validation errors point consistently ahead of targets
+
+GAZE_SMOOTH_SAMPLES    = 20
+MOUSE_SMOOTHING        = 0.75  # higher = smoother/slower, lower = snappier
+MOVE_THRESHOLD_PX      = 10
 
 DWELL_TIME_MS          = 300
 DWELL_RADIUS_PX        = 60
 
-# Edge gravity (screen edges)
-EDGE_GRAVITY_ZONE      = 0.03   # fraction of screen = gravity band
-EDGE_GRAVITY_STRENGTH  = 0.12   # pull strength toward screen edge (capped, never traps)
+# Edge gravity — disabled
+EDGE_GRAVITY_ZONE      = 0.0
+EDGE_GRAVITY_STRENGTH  = 0.0
 
-# UI element gravity (stronger than edge gravity)
-UI_GRAVITY_RADIUS_PX   = 80     # px — how close gaze must be to a UI element
-UI_GRAVITY_STRENGTH    = 0.45   # pull strength toward UI element centre
-UI_SCAN_INTERVAL_S     = 3.0    # how often to rescan UI elements (seconds)
+# UI element gravity — disabled
+UI_GRAVITY_RADIUS_PX   = 0
+UI_GRAVITY_STRENGTH    = 0.0
+UI_SCAN_INTERVAL_S     = 3.0
+
+# Precision mode: when gaze is stable, cursor slows to a crawl for fine control
+PRECISION_STABLE_MS    = 400    # how long gaze must be still to enter precision mode
+PRECISION_STABLE_PX    = 40     # radius within which gaze counts as "still"
+PRECISION_SMOOTHING    = 0.92   # smoothing in precision mode (much higher = much slower)
 # ──────────────────────────────────────────────────────────────────────────────
 
 DOT_RADIUS = 20
 DOT_INNER  = 6
-DWELL_MS   = 1400
+DWELL_MS   = 2200   # longer dwell per calibration point = more samples = better fit
 SHRINK_MS  = 500
 
 # Standard 5-point Tobii calibration
@@ -98,35 +114,98 @@ EDGE_TRACE_POINTS_NORM = [
 
 # ─── Edge Correction Model ────────────────────────────────────────────────────
 
+try:
+    import numpy as np
+    HAS_NUMPY = True
+except ImportError:
+    HAS_NUMPY = False
+    print("WARNING: numpy not found — using fallback 1D correction (less accurate).\n"
+          "  Install with:  py -3.10 -m pip install numpy")
+
+
 class EdgeCorrectionModel:
     """
-    Fits a per-axis piecewise linear map from observed gaze coords →
-    true screen coords, using the edge trace calibration data.
+    Fits a 2D polynomial warp from observed gaze → true screen coords.
 
-    For each axis (X and Y) we collect pairs:
-        (gaze_observed, screen_true)
-    then build a lookup table and interpolate at runtime.
+    With numpy: fits degree-2 polynomial surfaces for X and Y independently
+    using all calibration points together, capturing the nonlinear vertical
+    drift that is worst at screen edges.
+
+    Without numpy: falls back to per-axis piecewise linear interpolation.
     """
 
     def __init__(self):
-        self.x_pairs = []   # [(gaze_nx, true_nx), ...]
+        # For numpy polynomial fit
+        self._cx     = None   # coefficients for true_x = poly2d(gaze_x, gaze_y)
+        self._cy     = None   # coefficients for true_y = poly2d(gaze_x, gaze_y)
+        # For fallback
+        self.x_pairs = []
         self.y_pairs = []
         self._ready  = False
+        self._samples = []    # [(gaze_nx, gaze_ny, true_nx, true_ny), ...]
 
     def add_sample(self, true_nx, true_ny, gaze_nx, gaze_ny):
+        self._samples.append((gaze_nx, gaze_ny, true_nx, true_ny))
         self.x_pairs.append((gaze_nx, true_nx))
         self.y_pairs.append((gaze_ny, true_ny))
 
     def fit(self):
-        """Sort pairs and mark ready."""
-        self.x_pairs.sort(key=lambda p: p[0])
-        self.y_pairs.sort(key=lambda p: p[0])
-        self._ready = len(self.x_pairs) >= 4
+        if HAS_NUMPY and len(self._samples) >= 6:
+            self._fit_poly()
+        else:
+            self.x_pairs.sort(key=lambda p: p[0])
+            self.y_pairs.sort(key=lambda p: p[0])
+        self._ready = len(self._samples) >= 4
+
+    def _fit_poly(self):
+        """Fit affine (degree-1) transform: true = a + b*gx + c*gy
+        Degree-1 is more robust than degree-2 — less overfitting risk."""
+        gxs = np.array([s[0] for s in self._samples])
+        gys = np.array([s[1] for s in self._samples])
+        txs = np.array([s[2] for s in self._samples])
+        tys = np.array([s[3] for s in self._samples])
+
+        # Build design matrix for affine (degree-1) transform
+        A = np.column_stack([
+            np.ones_like(gxs),
+            gxs, gys,
+        ])
+
+        # Least-squares fit for each output axis
+        cx, _, _, _ = np.linalg.lstsq(A, txs, rcond=None)
+        cy, _, _, _ = np.linalg.lstsq(A, tys, rcond=None)
+
+        # Check residuals — if fit is poor, don't use it
+        pred_x = A @ cx
+        pred_y = A @ cy
+        rmse_x = np.sqrt(np.mean((pred_x - txs)**2))
+        rmse_y = np.sqrt(np.mean((pred_y - tys)**2))
+        print(f"  Calibration fit RMSE — X: {rmse_x:.4f}  Y: {rmse_y:.4f}  "
+              f"(lower is better; >0.08 suggests noisy calibration)")
+
+        # Only use polynomial if fit quality is acceptable
+        MAX_RMSE = 0.12
+        if rmse_x < MAX_RMSE and rmse_y < MAX_RMSE:
+            self._cx = cx
+            self._cy = cy
+            print("  ✓ 2D polynomial correction active.")
+        else:
+            print("  ⚠ Fit quality poor — falling back to 1D correction. "
+                  "Try redoing the edge calibration, staring very precisely at each dot.")
+            self._cx = None
+            self._cy = None
+
+    def _poly_eval(self, coeffs, gx, gy):
+        return coeffs[0] + coeffs[1]*gx + coeffs[2]*gy
 
     def correct(self, nx, ny):
         """Remap raw normalised gaze → corrected normalised gaze."""
         if not self._ready:
             return nx, ny
+        if HAS_NUMPY and self._cx is not None:
+            return (self._poly_eval(self._cx, nx, ny),
+                    self._poly_eval(self._cy, nx, ny))
+        # Fallback: 1D piecewise linear
         return (self._interp(nx, self.x_pairs),
                 self._interp(ny, self.y_pairs))
 
@@ -244,14 +323,15 @@ class UIScanner:
             self.targets = targets
 
 
-# ─── Calibration Window ───────────────────────────────────────────────────────
+# ─── Legacy Calibration Window (edge trace) ───────────────────────────────────
 
-class CalibrationWindow:
+class LegacyCalibrationWindow:
     """
-    Two-phase calibration:
+    Two-phase calibration (original / backup):
       Phase 1: standard Tobii 5-point calibration
       Phase 2: 20-point edge trace to build EdgeCorrectionModel
     Returns (accepted: bool, model: EdgeCorrectionModel)
+    Run with:  py -3.10 tobii_gaze_mouse.py --legacy
     """
 
     def __init__(self, tracker):
@@ -502,6 +582,395 @@ class CalibrationWindow:
         return self.accepted, self.edge_model
 
 
+# ─── Smooth Pursuit Calibration Window ───────────────────────────────────────
+
+class CalibrationWindow:
+    """
+    Three-phase calibration (default):
+      Phase 1: standard Tobii 5-point calibration
+      Phase 2: smooth pursuit — follow a moving dot (figure-8, ~15 s)
+               Collects hundreds of gaze→screen pairs across the full screen
+      Phase 3: validation grid — 9-point accuracy check with error display
+    Returns (accepted: bool, model: EdgeCorrectionModel)
+    """
+
+    PURSUIT_DURATION_S = 15.0   # how long the pursuit phase runs
+    PURSUIT_FPS        = 60     # animation frame rate
+    VALIDATION_POINTS  = [      # normalised (x, y) — 3×3 grid
+        (0.1, 0.1), (0.5, 0.1), (0.9, 0.1),
+        (0.1, 0.5), (0.5, 0.5), (0.9, 0.5),
+        (0.1, 0.9), (0.5, 0.9), (0.9, 0.9),
+    ]
+    VAL_DWELL_S = 1.5           # seconds per validation point
+
+    def __init__(self, tracker):
+        self.tracker    = tracker
+        self.accepted   = False
+        self.edge_model = EdgeCorrectionModel()
+
+        self.root = tk.Tk()
+        self.root.title("Tobii Calibration")
+        self.root.configure(bg="black")
+        self.root.attributes("-fullscreen", True)
+        self.root.attributes("-topmost",    True)
+
+        self.sw = self.root.winfo_screenwidth()
+        self.sh = self.root.winfo_screenheight()
+
+        self.canvas = tk.Canvas(self.root, bg="black", highlightthickness=0)
+        self.canvas.pack(fill=tk.BOTH, expand=True)
+
+        self._gaze_samples = []
+        self._collecting   = False
+        self._gaze_lock    = threading.Lock()
+        self._latest_gaze  = None   # most recent valid gaze point
+
+        self.root.bind("<Escape>", lambda e: self._abort())
+        self._draw_intro()
+
+    def _clear_widgets(self):
+        for w in self.root.winfo_children():
+            if isinstance(w, tk.Button):
+                w.destroy()
+
+    def _cx(self): return self.sw // 2
+    def _cy(self): return self.sh // 2
+
+    # ── Phase 0: intro ────────────────────────────────────────────────────────
+
+    def _draw_intro(self):
+        self.canvas.delete("all")
+        self._clear_widgets()
+        cx, cy = self._cx(), self._cy()
+        self.canvas.create_text(cx, cy - 140,
+            text="Tobii Gaze Mouse — Calibration",
+            fill="white", font=("Helvetica", 32, "bold"))
+        self.canvas.create_text(cx, cy - 40,
+            text="Three phases:\n\n"
+                 "  Phase 1 — Standard 5-point Tobii calibration\n"
+                 "  Phase 2 — Smooth pursuit: follow a moving dot for ~15 seconds\n"
+                 "             (covers the full screen, gives hundreds of data points)\n"
+                 "  Phase 3 — Validation: 9-point accuracy check\n"
+                 "             (see errors before accepting)",
+            fill="#aaaaaa", font=("Helvetica", 16), justify="center")
+        self.canvas.create_text(cx, cy + 120,
+            text="Click anywhere to begin Phase 1",
+            fill="#55aaff", font=("Helvetica", 20))
+        self.canvas.bind("<Button-1>", lambda e: self._start_tobii_calib())
+
+    # ── Phase 1: Tobii calibration ────────────────────────────────────────────
+
+    def _start_tobii_calib(self):
+        self.canvas.unbind("<Button-1>")
+        calib = tr.ScreenBasedCalibration(self.tracker)
+        calib.enter_calibration_mode()
+        threading.Thread(target=self._run_tobii_points,
+                         args=(calib,), daemon=True).start()
+
+    def _run_tobii_points(self, calib):
+        total = len(TOBII_CALIB_POINTS)
+        for i, (nx, ny) in enumerate(TOBII_CALIB_POINTS):
+            px, py = int(nx * self.sw), int(ny * self.sh)
+            self.root.after(0, self._draw_dot, px, py, DOT_RADIUS,
+                            f"Phase 1 of 3 — Point {i+1} of {total}")
+            time.sleep(SHRINK_MS / 1000)
+            calib.collect_data(nx, ny)
+            time.sleep(DWELL_MS / 1000)
+        result = calib.compute_and_apply()
+        calib.leave_calibration_mode()
+        self.root.after(0, self._show_tobii_result, result)
+
+    def _show_tobii_result(self, result):
+        self.canvas.delete("all")
+        self._clear_widgets()
+        cx, cy = self._cx(), self._cy()
+        if result.status == tr.CALIBRATION_STATUS_SUCCESS:
+            self.canvas.create_text(cx, cy - 60,
+                text="Phase 1 complete  ✓",
+                fill="#55ff88", font=("Helvetica", 28, "bold"))
+            self.canvas.create_text(cx, cy,
+                text="Now follow the moving dot with your eyes.",
+                fill="#aaaaaa", font=("Helvetica", 16))
+            btn = tk.Button(self.root, text="Continue to Smooth Pursuit →",
+                bg="#1a4e8c", fg="white", font=("Helvetica", 18, "bold"),
+                padx=20, pady=10, relief="flat", cursor="hand2",
+                command=self._start_pursuit_intro)
+            self.canvas.create_window(cx, cy + 70, window=btn)
+        else:
+            self.canvas.create_text(cx, cy - 60,
+                text="Phase 1 failed — please retry",
+                fill="#ff5555", font=("Helvetica", 28, "bold"))
+            btn = tk.Button(self.root, text="↺  Retry Phase 1",
+                bg="#2a2a2a", fg="white", font=("Helvetica", 18),
+                padx=20, pady=10, relief="flat", cursor="hand2",
+                command=self._draw_intro)
+            self.canvas.create_window(cx, cy + 60, window=btn)
+
+    # ── Phase 2: Smooth pursuit ───────────────────────────────────────────────
+
+    def _start_pursuit_intro(self):
+        self.canvas.delete("all")
+        self._clear_widgets()
+        cx, cy = self._cx(), self._cy()
+        self.canvas.create_text(cx, cy - 80,
+            text="Phase 2 — Smooth Pursuit",
+            fill="white", font=("Helvetica", 28, "bold"))
+        self.canvas.create_text(cx, cy,
+            text=f"A dot will move around the screen for {int(self.PURSUIT_DURATION_S)} seconds.\n"
+                  "Follow it smoothly with your eyes — don't move your head.\n"
+                  "Keep your eyes on the dot the whole time.",
+            fill="#aaaaaa", font=("Helvetica", 16), justify="center")
+        self.canvas.create_text(cx, cy + 100,
+            text="Click anywhere to begin",
+            fill="#55aaff", font=("Helvetica", 20))
+        self.canvas.bind("<Button-1>", lambda e: self._start_pursuit())
+
+    def _pursuit_pos(self, t):
+        """Figure-8 (Lissajous) path, inset from screen edges."""
+        margin_x = int(self.sw * 0.12)
+        margin_y = int(self.sh * 0.12)
+        rx = (self.sw - 2 * margin_x) / 2
+        ry = (self.sh - 2 * margin_y) / 2
+        # figure-8: x = sin(t), y = sin(2t)/2  (slow enough to track)
+        speed = 2 * math.pi / self.PURSUIT_DURATION_S * 2
+        x = self.sw / 2 + rx * math.sin(speed * t)
+        y = self.sh / 2 + ry * math.sin(speed * t * 2) / 2
+        return int(x), int(y)
+
+    def _collect_gaze(self, gaze_data):
+        l_pt = gaze_data["left_gaze_point_on_display_area"]
+        r_pt = gaze_data["right_gaze_point_on_display_area"]
+        lv   = gaze_data["left_gaze_point_validity"]
+        rv   = gaze_data["right_gaze_point_validity"]
+        pts  = []
+        if lv and l_pt[0] == l_pt[0]: pts.append(l_pt)
+        if rv and r_pt[0] == r_pt[0]: pts.append(r_pt)
+        if pts:
+            ax = sum(p[0] for p in pts) / len(pts)
+            ay = sum(p[1] for p in pts) / len(pts)
+            self._latest_gaze = (ax, ay)
+            if self._collecting:
+                with self._gaze_lock:
+                    self._gaze_samples.append((ax, ay, time.time()))
+
+    def _start_pursuit(self):
+        self.canvas.unbind("<Button-1>")
+        self._gaze_samples = []
+        self._collecting   = True
+        self.tracker.subscribe_to(
+            tr.EYETRACKER_GAZE_DATA, self._collect_gaze, as_dictionary=True)
+        threading.Thread(target=self._run_pursuit, daemon=True).start()
+
+    def _run_pursuit(self):
+        t0    = time.time()
+        frame = 0
+        interval = 1.0 / self.PURSUIT_FPS
+        while True:
+            t = time.time() - t0
+            if t >= self.PURSUIT_DURATION_S:
+                break
+            px, py = self._pursuit_pos(t)
+            pct    = t / self.PURSUIT_DURATION_S * 100
+            self.root.after(0, self._draw_pursuit_frame, px, py, pct)
+            frame += 1
+            next_t = t0 + frame * interval
+            sleep  = next_t - time.time()
+            if sleep > 0:
+                time.sleep(sleep)
+
+        self._collecting = False
+        self.tracker.unsubscribe_from(tr.EYETRACKER_GAZE_DATA, self._collect_gaze)
+
+        # Build calibration model from pursuit data
+        # Each gaze sample is paired with the dot position at that timestamp
+        t0_abs = time.time() - self.PURSUIT_DURATION_S
+        with self._gaze_lock:
+            samples = list(self._gaze_samples)
+
+        self.edge_model = EdgeCorrectionModel()
+        t_start = samples[0][2] if samples else 0
+        t_end   = samples[-1][2] if samples else 0
+        dur     = t_end - t_start if t_end > t_start else 1
+        lag_s   = PURSUIT_LAG_MS / 1000.0
+
+        for (gx, gy, ts) in samples:
+            # Pair gaze with where the dot WAS lag_s seconds earlier
+            # (eyes trail a moving target by ~100-150ms)
+            t_norm = ((ts - lag_s) - t_start) / dur * self.PURSUIT_DURATION_S
+            t_norm = max(0.0, t_norm)
+            dot_px, dot_py = self._pursuit_pos(t_norm)
+            true_nx = dot_px / self.sw
+            true_ny = dot_py / self.sh
+            self.edge_model.add_sample(true_nx, true_ny, gx, gy)
+
+        self.edge_model.fit()
+        n = len(samples)
+        print(f"  Pursuit collected {n} gaze samples.")
+        self.root.after(0, self._show_pursuit_result, n)
+
+    def _draw_pursuit_frame(self, px, py, pct):
+        self.canvas.delete("all")
+        r = DOT_RADIUS
+        self.canvas.create_text(self.sw // 2, 30,
+            text=f"Phase 2 of 3 — Follow the dot  ({pct:.0f}%)",
+            fill="#666666", font=("Helvetica", 14))
+        self.canvas.create_oval(px-r, py-r, px+r, py+r,
+            outline="#55aaff", width=2, fill="")
+        self.canvas.create_oval(px-DOT_INNER, py-DOT_INNER,
+                                px+DOT_INNER, py+DOT_INNER,
+            fill="white", outline="")
+
+    def _show_pursuit_result(self, n):
+        self.canvas.delete("all")
+        self._clear_widgets()
+        cx, cy = self._cx(), self._cy()
+        self.canvas.create_text(cx, cy - 60,
+            text="Phase 2 complete  ✓",
+            fill="#55ff88", font=("Helvetica", 28, "bold"))
+        self.canvas.create_text(cx, cy,
+            text=f"Collected {n} gaze samples.\nNow verifying accuracy across 9 screen positions.",
+            fill="#aaaaaa", font=("Helvetica", 16), justify="center")
+        btn = tk.Button(self.root, text="Continue to Validation →",
+            bg="#1a4e8c", fg="white", font=("Helvetica", 18, "bold"),
+            padx=20, pady=10, relief="flat", cursor="hand2",
+            command=self._start_validation)
+        self.canvas.create_window(cx, cy + 80, window=btn)
+
+    # ── Phase 3: Validation grid ──────────────────────────────────────────────
+
+    def _start_validation(self):
+        self.canvas.delete("all")
+        self._clear_widgets()
+        self._val_errors  = []   # [(true_x, true_y, err_px), ...]
+        self._val_vectors = []   # [(true_px, true_py, gaze_px, gaze_py), ...]
+        self.tracker.subscribe_to(
+            tr.EYETRACKER_GAZE_DATA, self._collect_gaze, as_dictionary=True)
+        threading.Thread(target=self._run_validation, daemon=True).start()
+
+    def _run_validation(self):
+        total = len(self.VALIDATION_POINTS)
+        for i, (nx, ny) in enumerate(self.VALIDATION_POINTS):
+            margin = 40
+            px = int(nx * (self.sw - 2*margin)) + margin
+            py = int(ny * (self.sh - 2*margin)) + margin
+            self.root.after(0, self._draw_dot, px, py, DOT_RADIUS,
+                            f"Phase 3 of 3 — Validation point {i+1} of {total}",
+                            "#ff9933")
+            time.sleep(0.4)   # let eyes land
+
+            # Collect samples
+            with self._gaze_lock:
+                self._gaze_samples = []
+            self._collecting = True
+            time.sleep(self.VAL_DWELL_S)
+            self._collecting = False
+
+            with self._gaze_lock:
+                samps = list(self._gaze_samples)
+
+            if samps:
+                avg_gx = sum(s[0] for s in samps) / len(samps)
+                avg_gy = sum(s[1] for s in samps) / len(samps)
+                # Apply correction
+                corr_nx, corr_ny = self.edge_model.correct(avg_gx, avg_gy)
+                corr_px = int(corr_nx * self.sw)
+                corr_py = int(corr_ny * self.sh)
+                err = math.hypot(corr_px - px, corr_py - py)
+                self._val_errors.append((nx, ny, err))
+                self._val_vectors.append((px, py, corr_px, corr_py))
+
+        self._collecting = False
+        self.tracker.unsubscribe_from(tr.EYETRACKER_GAZE_DATA, self._collect_gaze)
+        self.root.after(0, self._show_validation_result)
+
+    def _show_validation_result(self):
+        self.canvas.delete("all")
+        self._clear_widgets()
+
+        # Draw error vectors on a dark grid
+        for (true_px, true_py, gaze_px, gaze_py) in self._val_vectors:
+            # True target
+            self.canvas.create_oval(
+                true_px-8, true_py-8, true_px+8, true_py+8,
+                outline="#55ff88", width=2, fill="")
+            # Corrected gaze landing
+            self.canvas.create_oval(
+                gaze_px-5, gaze_py-5, gaze_px+5, gaze_py+5,
+                fill="#ff5555", outline="")
+            # Error vector
+            self.canvas.create_line(
+                true_px, true_py, gaze_px, gaze_py,
+                fill="#ffaa00", width=1, dash=(4, 3))
+
+        cx, cy = self._cx(), self._cy()
+        if self._val_errors:
+            avg_err = sum(e[2] for e in self._val_errors) / len(self._val_errors)
+            max_err = max(e[2] for e in self._val_errors)
+            self.canvas.create_text(cx, 40,
+                text=f"Validation complete  —  avg error: {avg_err:.0f} px   "
+                     f"max: {max_err:.0f} px",
+                fill="white", font=("Helvetica", 16, "bold"))
+            self.canvas.create_text(cx, 70,
+                text="Green circle = target   Red dot = where gaze landed   "
+                     "Orange line = error",
+                fill="#888888", font=("Helvetica", 13))
+        else:
+            self.canvas.create_text(cx, 50,
+                text="No validation data collected.",
+                fill="#ff5555", font=("Helvetica", 16))
+
+        accept_btn = tk.Button(self.root, text="✓  Accept & Start Gaze Mouse",
+            bg="#1a6e3c", fg="white", font=("Helvetica", 18, "bold"),
+            padx=20, pady=10, relief="flat", cursor="hand2",
+            command=self._accept)
+        self.canvas.create_window(cx - 160, self.sh - 60, window=accept_btn)
+        retry_btn = tk.Button(self.root, text="↺  Redo Pursuit",
+            bg="#2a2a2a", fg="white", font=("Helvetica", 18),
+            padx=20, pady=10, relief="flat", cursor="hand2",
+            command=self._start_pursuit_intro)
+        self.canvas.create_window(cx + 130, self.sh - 60, window=retry_btn)
+
+    # ── Shared dot drawing ────────────────────────────────────────────────────
+
+    def _draw_dot(self, px, py, radius, label, colour="#55aaff"):
+        self.canvas.delete("all")
+        self._clear_widgets()
+        self.canvas.create_text(self.sw // 2, 36,
+            text=label, fill="#666666", font=("Helvetica", 15))
+        self.canvas.create_oval(
+            px-radius, py-radius, px+radius, py+radius,
+            outline=colour, width=2, fill="")
+        self.canvas.create_oval(
+            px-DOT_INNER, py-DOT_INNER, px+DOT_INNER, py+DOT_INNER,
+            fill="white", outline="")
+        self._animate_shrink(px, py, radius, DOT_INNER, time.time(), colour)
+
+    def _animate_shrink(self, px, py, start_r, min_r, t0, colour="#55aaff"):
+        elapsed = (time.time() - t0) * 1000
+        frac    = min(elapsed / SHRINK_MS, 1.0)
+        r       = start_r - frac * (start_r - min_r)
+        self.canvas.delete("shrink_ring")
+        self.canvas.create_oval(px-r, py-r, px+r, py+r,
+            outline=colour, width=2, fill="", tags="shrink_ring")
+        if frac < 1.0:
+            self.root.after(16, self._animate_shrink,
+                            px, py, start_r, min_r, t0, colour)
+
+    # ── Accept / abort ────────────────────────────────────────────────────────
+
+    def _accept(self):
+        self.accepted = True
+        self.root.destroy()
+
+    def _abort(self):
+        self.accepted = False
+        self.root.destroy()
+
+    def run(self):
+        self.root.mainloop()
+        return self.accepted, self.edge_model
+
+
 # ─── Gaze Mouse + Blink Controller ───────────────────────────────────────────
 
 class GazeMouseController:
@@ -523,6 +992,10 @@ class GazeMouseController:
         self.dwell_history = collections.deque()
         self.dwell_locked  = False
         self.dwell_pos     = None
+
+        # Precision mode
+        self.precision_history = collections.deque()
+        self.precision_active  = False
 
         # Blink
         self.in_blink       = False
@@ -641,6 +1114,7 @@ class GazeMouseController:
 
             # 1. Personal edge correction (from edge trace calibration)
             ax, ay = self.edge_model.correct(ax, ay)
+            ay = ay + GAZE_Y_OFFSET          # vertical bias correction
             ax = max(0.0, min(ax, 1.0))
             ay = max(0.0, min(ay, 1.0))
 
@@ -655,17 +1129,29 @@ class GazeMouseController:
                 ry = int(sum(g[1] for g in self.gaze_buffer) / len(self.gaze_buffer))
                 self.last_gaze = (rx, ry)
 
-                # Exponential smoothing on top of the rolling average
-                self.smooth_x += (rx - self.smooth_x) * (1.0 - MOUSE_SMOOTHING)
-                self.smooth_y += (ry - self.smooth_y) * (1.0 - MOUSE_SMOOTHING)
+                # Precision mode: check if gaze has been stable recently
+                self.precision_history.append((now_ms, rx, ry))
+                cutoff = now_ms - PRECISION_STABLE_MS
+                while self.precision_history and self.precision_history[0][0] < cutoff:
+                    self.precision_history.popleft()
+                if len(self.precision_history) >= 3:
+                    xs = [p[1] for p in self.precision_history]
+                    ys = [p[2] for p in self.precision_history]
+                    cx = sum(xs) / len(xs)
+                    cy = sum(ys) / len(ys)
+                    stable = all(
+                        self._dist(p[1], p[2], cx, cy) <= PRECISION_STABLE_PX
+                        for p in self.precision_history)
+                    self.precision_active = stable
+                else:
+                    self.precision_active = False
+
+                # Exponential smoothing — tighter in precision mode
+                smoothing = PRECISION_SMOOTHING if self.precision_active else MOUSE_SMOOTHING
+                self.smooth_x += (rx - self.smooth_x) * (1.0 - smoothing)
+                self.smooth_y += (ry - self.smooth_y) * (1.0 - smoothing)
                 sx = int(self.smooth_x)
                 sy = int(self.smooth_y)
-
-                # Apply gravity AFTER smoothing so noise is not amplified
-                # 2. Screen edge gravity
-                sx, sy = self._apply_edge_gravity(sx, sy)
-                # 3. UI element gravity (stronger, applied on top)
-                sx, sy = self._apply_ui_gravity(sx, sy)
 
                 # Store final position for blink snapshot
                 self._last_display_x = sx
@@ -766,6 +1252,11 @@ class GazeMouseController:
 # ─── Entry Point ──────────────────────────────────────────────────────────────
 
 def main():
+    parser = argparse.ArgumentParser(description="Tobii Gaze Mouse")
+    parser.add_argument("--legacy", action="store_true",
+                        help="Use legacy edge-trace calibration instead of smooth pursuit")
+    args = parser.parse_args()
+
     print("Searching for Tobii eye trackers …")
     trackers = tr.find_all_eyetrackers()
     if not trackers:
@@ -775,12 +1266,17 @@ def main():
     tracker = trackers[0]
     print(f"Found: {tracker.model}  (S/N {tracker.serial_number})\n")
 
-    accepted, edge_model = CalibrationWindow(tracker).run()
+    if args.legacy:
+        print("Using legacy edge-trace calibration.")
+        accepted, edge_model = LegacyCalibrationWindow(tracker).run()
+    else:
+        accepted, edge_model = CalibrationWindow(tracker).run()
+
     if not accepted:
         print("Calibration cancelled.")
         sys.exit(0)
 
-    print(f"Calibration complete — edge model has {len(edge_model.x_pairs)} samples.")
+    print(f"Calibration complete — {len(edge_model._samples)} samples collected.")
 
     sw, sh = pyautogui.size()
     ui_scanner = UIScanner(sw, sh) if HAS_PYWINAUTO else None
